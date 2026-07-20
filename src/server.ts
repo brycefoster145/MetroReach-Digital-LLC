@@ -24,6 +24,8 @@ import {
   initDb, getTenantBySlug, getTenantById, getAllTenants, upsertTenant,
   getDepartments, upsertDepartment, getAppointments, getLeads,
   createAppointment, updateAppointment, getCalls, saveCall,
+  getCallerProfile, getLeadScores, getPaymentIntents,
+  getWorkflows, getMessages, createWorkflow,
 } from "./db.js";
 import { chat, captureLead } from "./agent.js";
 import {
@@ -31,6 +33,15 @@ import {
   handleIVR, handleRecordingCallback,
 } from "./voice.js";
 import { bookAppointment, rescheduleAppointment, cancelAppointment } from "./appointments.js";
+import { recognizeCaller, tagCaller } from "./memory.js";
+import { scoreLead, getTopLeads } from "./scoring.js";
+import { analyzeCallSentiment, getCallSentimentSummary } from "./sentiment.js";
+import { findContact, logCallToCrm } from "./crm.js";
+import { sendSms } from "./sms.js";
+import { sendEmail, sendInvoice } from "./email.js";
+import { createPayment, checkPaymentStatus, requestDeposit } from "./payments.js";
+import { postCallFollowUp, paymentFollowUpSequence } from "./followups.js";
+import { fireTrigger, WORKFLOW_TEMPLATES } from "./workflows.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -112,13 +123,14 @@ app.get("/widget/:slug.js", async (req, res) => {
 // ── Twilio Voice endpoints ────────────────────────────
 app.post("/api/twilio/voice", async (req, res) => {
   const slug = (req.query.slug as string) || "demo";
-  const twiml = await handleIncomingCall(slug);
+  const from = req.body?.From || "";
+  const twiml = await handleIncomingCall(slug, from);
   res.type("text/xml").send(twiml);
 });
 
 app.post("/api/twilio/voice/ivr", async (req, res) => {
   const slug = (req.query.slug as string) || "demo";
-  const digits = req.body.Digits || "";
+  const digits = req.body?.Digits || "";
   const twiml = await handleIVR(slug, digits);
   res.type("text/xml").send(twiml);
 });
@@ -126,24 +138,25 @@ app.post("/api/twilio/voice/ivr", async (req, res) => {
 app.post("/api/twilio/voice/respond", async (req, res) => {
   const slug = (req.query.slug as string) || "demo";
   const dept = req.query.dept as string | undefined;
-  const speechResult = req.body.SpeechResult || "";
-  const callSid = req.body.CallSid || "";
-  const twiml = await handleSpeechResponse(slug, speechResult, callSid, dept);
+  const speechResult = req.body?.SpeechResult || "";
+  const callSid = req.body?.CallSid || "";
+  const from = req.body?.From || "";
+  const twiml = await handleSpeechResponse(slug, speechResult, callSid, dept, from);
   res.type("text/xml").send(twiml);
 });
 
 app.post("/api/twilio/voice/capture", async (req, res) => {
   const slug = (req.query.slug as string) || "demo";
-  const speechResult = req.body.SpeechResult || "";
-  const from = req.body.From || "";
+  const speechResult = req.body?.SpeechResult || "";
+  const from = req.body?.From || "";
   const twiml = await handleLeadCapture(slug, speechResult, from);
   res.type("text/xml").send(twiml);
 });
 
 app.post("/api/twilio/voice/record-cb", async (req, res) => {
-  const callSid = req.body.CallSid || "";
-  const recordingUrl = req.body.RecordingUrl || "";
-  const duration = req.body.RecordingDuration || "0";
+  const callSid = req.body?.CallSid || "";
+  const recordingUrl = req.body?.RecordingUrl || "";
+  const duration = req.body?.RecordingDuration || "0";
   await handleRecordingCallback(callSid, recordingUrl, duration);
   res.sendStatus(200);
 });
@@ -278,14 +291,184 @@ app.post("/api/admin/departments", async (req, res) => {
   res.status(201).json(dept);
 });
 
+// ── Phase 2: Caller Memory ───────────────────────────
+app.get("/api/callers/:slug", async (req, res) => {
+  const tenant = await getTenantBySlug(req.params.slug);
+  if (!tenant) { res.status(404).json({ error: "Not found" }); return; }
+  const phone = req.query.phone as string;
+  if (!phone) { res.status(400).json({ error: "phone query param required" }); return; }
+  const ctx = await recognizeCaller(tenant.id, phone);
+  res.json(ctx);
+});
+
+app.post("/api/callers/:slug/tag", async (req, res) => {
+  const tenant = await getTenantBySlug(req.params.slug);
+  if (!tenant) { res.status(404).json({ error: "Not found" }); return; }
+  const { phone, tags } = req.body;
+  if (!phone || !tags) { res.status(400).json({ error: "phone and tags required" }); return; }
+  await tagCaller(tenant.id, phone, Array.isArray(tags) ? tags : [tags]);
+  res.json({ success: true });
+});
+
+// ── Phase 2: Lead Scoring ─────────────────────────────
+app.get("/api/leads/:slug/scores", async (req, res) => {
+  const tenant = await getTenantBySlug(req.params.slug);
+  if (!tenant) { res.status(404).json({ error: "Not found" }); return; }
+  const tier = req.query.tier as string | undefined;
+  res.json(await getTopLeads(tenant.id, tier as any));
+});
+
+app.post("/api/leads/:slug/score", async (req, res) => {
+  const tenant = await getTenantBySlug(req.params.slug);
+  if (!tenant) { res.status(404).json({ error: "Not found" }); return; }
+  const result = await scoreLead(tenant.id, req.body);
+  res.json(result);
+});
+
+// ── Phase 2: Sentiment ────────────────────────────────
+app.get("/api/calls/:callId/sentiment", async (req, res) => {
+  const summary = await getCallSentimentSummary(req.params.callId);
+  res.json(summary);
+});
+
+app.post("/api/calls/:callId/sentiment", async (req, res) => {
+  const { segments } = req.body;
+  if (!segments?.length) { res.status(400).json({ error: "segments array required" }); return; }
+  res.json({ success: true });
+});
+
+// ── Phase 2: CRM ──────────────────────────────────────
+app.post("/api/crm/:slug/find-contact", async (req, res) => {
+  const tenant = await getTenantBySlug(req.params.slug);
+  if (!tenant) { res.status(404).json({ error: "Not found" }); return; }
+  const { phone, email } = req.body;
+  const contact = await findContact(tenant.id, phone || email);
+  res.json(contact ? { found: true, contact } : { found: false });
+});
+
+app.post("/api/crm/:slug/log-call", async (req, res) => {
+  const tenant = await getTenantBySlug(req.params.slug);
+  if (!tenant) { res.status(404).json({ error: "Not found" }); return; }
+  const ok = await logCallToCrm(tenant.id, req.body);
+  res.json({ success: ok });
+});
+
+// ── Phase 3: SMS ──────────────────────────────────────
+app.post("/api/sms/:slug/send", async (req, res) => {
+  const tenant = await getTenantBySlug(req.params.slug);
+  if (!tenant) { res.status(404).json({ error: "Not found" }); return; }
+  const { to, body } = req.body;
+  if (!to || !body) { res.status(400).json({ error: "to and body required" }); return; }
+  const result = await sendSms(tenant.id, to, body);
+  res.json(result);
+});
+
+// ── Phase 3: Email ────────────────────────────────────
+app.post("/api/email/:slug/send", async (req, res) => {
+  const tenant = await getTenantBySlug(req.params.slug);
+  if (!tenant) { res.status(404).json({ error: "Not found" }); return; }
+  const { to, subject, body } = req.body;
+  if (!to || !subject || !body) { res.status(400).json({ error: "to, subject, body required" }); return; }
+  const result = await sendEmail(tenant.id, to, subject, body);
+  res.json(result);
+});
+
+app.post("/api/email/:slug/invoice", async (req, res) => {
+  const tenant = await getTenantBySlug(req.params.slug);
+  if (!tenant) { res.status(404).json({ error: "Not found" }); return; }
+  const { to, amount, description } = req.body;
+  if (!to || !amount) { res.status(400).json({ error: "to and amount required" }); return; }
+  const result = await sendInvoice(tenant.id, to, amount, description || "Services", tenant.name);
+  res.json(result);
+});
+
+// ── Phase 3: Payments ─────────────────────────────────
+app.post("/api/payments/:slug/create", async (req, res) => {
+  const tenant = await getTenantBySlug(req.params.slug);
+  if (!tenant) { res.status(404).json({ error: "Not found" }); return; }
+  const result = await createPayment(tenant.id, req.body);
+  res.json(result);
+});
+
+app.get("/api/payments/:slug/status/:stripePiId", async (req, res) => {
+  const status = await checkPaymentStatus(req.params.stripePiId);
+  res.json(status);
+});
+
+app.post("/api/payments/:slug/deposit", async (req, res) => {
+  const tenant = await getTenantBySlug(req.params.slug);
+  if (!tenant) { res.status(404).json({ error: "Not found" }); return; }
+  const { email, name, totalAmount, depositPercent, description } = req.body;
+  if (!email || !totalAmount) { res.status(400).json({ error: "email and totalAmount required" }); return; }
+  const result = await requestDeposit(tenant.id, email, name, totalAmount, depositPercent, description);
+  res.json(result);
+});
+
+app.get("/api/payments/:slug/history", async (req, res) => {
+  const tenant = await getTenantBySlug(req.params.slug);
+  if (!tenant) { res.status(404).json({ error: "Not found" }); return; }
+  res.json(await getPaymentIntents(tenant.id));
+});
+
+// ── Phase 3: Follow-ups ───────────────────────────────
+app.post("/api/followups/:slug/post-call", async (req, res) => {
+  const tenant = await getTenantBySlug(req.params.slug);
+  if (!tenant) { res.status(404).json({ error: "Not found" }); return; }
+  const result = await postCallFollowUp(
+    { tenantId: tenant.id, businessName: tenant.name, ...req.body.config },
+    req.body.outcome,
+  );
+  res.json(result);
+});
+
+// ── Phase 3: Workflows ────────────────────────────────
+app.get("/api/workflows/:slug", async (req, res) => {
+  const tenant = await getTenantBySlug(req.params.slug);
+  if (!tenant) { res.status(404).json({ error: "Not found" }); return; }
+  res.json(await getWorkflows(tenant.id));
+});
+
+app.post("/api/workflows/:slug", async (req, res) => {
+  const tenant = await getTenantBySlug(req.params.slug);
+  if (!tenant) { res.status(404).json({ error: "Not found" }); return; }
+  const { name, trigger_event, conditions, actions } = req.body;
+  if (!name || !trigger_event || !actions) { res.status(400).json({ error: "name, trigger_event, actions required" }); return; }
+  const wf = await createWorkflow({
+    id: randomUUID(), tenant_id: tenant.id, name, trigger_event,
+    conditions: typeof conditions === "string" ? conditions : JSON.stringify(conditions || {}),
+    actions: typeof actions === "string" ? actions : JSON.stringify(actions),
+  });
+  res.status(201).json(wf);
+});
+
+app.post("/api/workflows/:slug/trigger", async (req, res) => {
+  const tenant = await getTenantBySlug(req.params.slug);
+  if (!tenant) { res.status(404).json({ error: "Not found" }); return; }
+  const { event, data } = req.body;
+  if (!event) { res.status(400).json({ error: "event required" }); return; }
+  const result = await fireTrigger({ event, tenantId: tenant.id, data: data || {} });
+  res.json(result);
+});
+
+app.get("/api/workflows/:slug/templates", async (_req, res) => {
+  res.json(WORKFLOW_TEMPLATES);
+});
+
+// ── Phase 3: Messages ─────────────────────────────────
+app.get("/api/messages/:slug", async (req, res) => {
+  const tenant = await getTenantBySlug(req.params.slug);
+  if (!tenant) { res.status(404).json({ error: "Not found" }); return; }
+  res.json(await getMessages(tenant.id));
+});
+
 // ── Health ────────────────────────────────────────────
 app.get("/health", (_req, res) => {
-  res.json({ status: "ok", phase: 1, timestamp: new Date().toISOString() });
+  res.json({ status: "ok", phase: "2+3", timestamp: new Date().toISOString() });
 });
 
 // ── Start ─────────────────────────────────────────────
 app.listen(PORT, "127.0.0.1", () => {
-  console.log(`🧠 AI Receptionist Phase 1 running on http://127.0.0.1:${PORT}`);
+  console.log(`🧠 AI Receptionist Phase 2&3 running on http://127.0.0.1:${PORT}`);
   console.log(`   Demo: http://127.0.0.1:${PORT}/widget/demo.js`);
 });
 

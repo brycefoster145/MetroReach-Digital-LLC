@@ -166,7 +166,123 @@ export async function initDb(): Promise<void> {
 
   await query(`CREATE INDEX IF NOT EXISTS idx_calls_tenant ON calls(tenant_id)`);
 
-  console.log(`✅ Database initialized (${hasPostgres() ? "Postgres" : "SQLite"})`);
+  // Phase 2 — Caller profiles (memory)
+  await query(`
+    CREATE TABLE IF NOT EXISTS caller_profiles (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL,
+      phone_number TEXT NOT NULL,
+      name TEXT,
+      email TEXT,
+      total_calls INTEGER DEFAULT 1,
+      last_call_at TEXT DEFAULT (datetime('now')),
+      tags TEXT DEFAULT '[]',
+      notes TEXT DEFAULT '',
+      preferred_contact TEXT DEFAULT 'phone',
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (tenant_id) REFERENCES tenants(id),
+      UNIQUE(tenant_id, phone_number)
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_caller_profile_phone ON caller_profiles(tenant_id, phone_number)`);
+
+  // Phase 2 — Lead scores
+  await query(`
+    CREATE TABLE IF NOT EXISTS lead_scores (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL,
+      lead_id TEXT,
+      caller_profile_id TEXT,
+      score INTEGER DEFAULT 0,
+      tier TEXT DEFAULT 'cold',
+      factors TEXT DEFAULT '{}',
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (tenant_id) REFERENCES tenants(id)
+    )
+  `);
+
+  // Phase 2 — Sentiment logs
+  await query(`
+    CREATE TABLE IF NOT EXISTS sentiment_logs (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL,
+      call_id TEXT,
+      segment_text TEXT,
+      sentiment TEXT DEFAULT 'neutral',
+      score REAL DEFAULT 0.0,
+      detected_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (tenant_id) REFERENCES tenants(id)
+    )
+  `);
+
+  // Phase 3 — Messages (SMS, email, WhatsApp)
+  await query(`
+    CREATE TABLE IF NOT EXISTS messages (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL,
+      recipient TEXT NOT NULL,
+      channel TEXT NOT NULL DEFAULT 'sms',
+      direction TEXT NOT NULL DEFAULT 'outbound',
+      body TEXT NOT NULL,
+      status TEXT DEFAULT 'sent',
+      external_id TEXT,
+      metadata TEXT DEFAULT '{}',
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (tenant_id) REFERENCES tenants(id)
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_messages_tenant ON messages(tenant_id)`);
+
+  // Phase 3 — Payment intents
+  await query(`
+    CREATE TABLE IF NOT EXISTS payment_intents (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL,
+      stripe_pi_id TEXT,
+      amount INTEGER NOT NULL,
+      currency TEXT DEFAULT 'usd',
+      status TEXT DEFAULT 'pending',
+      customer_email TEXT,
+      customer_name TEXT,
+      description TEXT,
+      metadata TEXT DEFAULT '{}',
+      completed_at TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (tenant_id) REFERENCES tenants(id)
+    )
+  `);
+
+  // Phase 3 — Workflows
+  await query(`
+    CREATE TABLE IF NOT EXISTS workflows (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      trigger_event TEXT NOT NULL,
+      conditions TEXT DEFAULT '{}',
+      actions TEXT NOT NULL DEFAULT '[]',
+      enabled INTEGER DEFAULT 1,
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (tenant_id) REFERENCES tenants(id)
+    )
+  `);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS workflow_runs (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL,
+      workflow_id TEXT NOT NULL,
+      trigger_data TEXT DEFAULT '{}',
+      status TEXT DEFAULT 'completed',
+      results TEXT DEFAULT '[]',
+      run_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (tenant_id) REFERENCES tenants(id)
+    )
+  `);
+
+  console.log(`✅ Database initialized (${hasPostgres() ? "Postgres" : "SQLite"}) [Phase 2&3]`);
 }
 
 // ── Tenant queries ───────────────────────────────────────
@@ -345,4 +461,170 @@ export async function saveCall(call: {
 
 export async function getCalls(tenantId: string) {
   return query("SELECT * FROM calls WHERE tenant_id = ? ORDER BY created_at DESC", [tenantId]);
+}
+
+// ── Phase 2: Caller Profile queries ──────────────────────
+export async function getCallerProfile(tenantId: string, phoneNumber: string) {
+  return queryOne("SELECT * FROM caller_profiles WHERE tenant_id = ? AND phone_number = ?", [tenantId, phoneNumber]);
+}
+
+export async function upsertCallerProfile(profile: {
+  id: string;
+  tenant_id: string;
+  phone_number: string;
+  name?: string;
+  email?: string;
+  tags?: string;
+  notes?: string;
+}) {
+  const existing = await getCallerProfile(profile.tenant_id, profile.phone_number);
+  if (existing) {
+    await query(
+      `UPDATE caller_profiles SET name=COALESCE(?,name), email=COALESCE(?,email), total_calls=total_calls+1, last_call_at=datetime('now'), tags=COALESCE(?,tags), notes=COALESCE(?,notes), updated_at=datetime('now') WHERE id=?`,
+      [profile.name || null, profile.email || null, profile.tags || null, profile.notes || null, existing.id],
+    );
+    return queryOne("SELECT * FROM caller_profiles WHERE id = ?", [existing.id]);
+  }
+  await query(
+    `INSERT INTO caller_profiles (id, tenant_id, phone_number, name, email, tags, notes) VALUES (?,?,?,?,?,?,?)`,
+    [profile.id, profile.tenant_id, profile.phone_number, profile.name || null, profile.email || null, profile.tags || "[]", profile.notes || ""],
+  );
+  return queryOne("SELECT * FROM caller_profiles WHERE id = ?", [profile.id]);
+}
+
+export async function getCallerCalls(tenantId: string, phoneNumber: string) {
+  return query("SELECT * FROM calls WHERE tenant_id = ? AND from_number = ? ORDER BY created_at DESC LIMIT 20", [tenantId, phoneNumber]);
+}
+
+// ── Phase 2: Lead Scoring queries ────────────────────────
+export async function saveLeadScore(score: {
+  id: string;
+  tenant_id: string;
+  lead_id?: string;
+  caller_profile_id?: string;
+  score: number;
+  tier: string;
+  factors: string;
+}) {
+  await query(
+    `INSERT INTO lead_scores (id, tenant_id, lead_id, caller_profile_id, score, tier, factors) VALUES (?,?,?,?,?,?,?)`,
+    [score.id, score.tenant_id, score.lead_id || null, score.caller_profile_id || null, score.score, score.tier, score.factors],
+  );
+  return queryOne("SELECT * FROM lead_scores WHERE id = ?", [score.id]);
+}
+
+export async function getLeadScores(tenantId: string) {
+  return query("SELECT * FROM lead_scores WHERE tenant_id = ? ORDER BY score DESC", [tenantId]);
+}
+
+// ── Phase 2: Sentiment queries ───────────────────────────
+export async function saveSentimentLog(entry: {
+  id: string;
+  tenant_id: string;
+  call_id?: string;
+  segment_text: string;
+  sentiment: string;
+  score: number;
+}) {
+  await query(
+    `INSERT INTO sentiment_logs (id, tenant_id, call_id, segment_text, sentiment, score) VALUES (?,?,?,?,?,?)`,
+    [entry.id, entry.tenant_id, entry.call_id || null, entry.segment_text, entry.sentiment, entry.score],
+  );
+}
+
+export async function getCallSentiment(callId: string) {
+  return query("SELECT * FROM sentiment_logs WHERE call_id = ? ORDER BY detected_at", [callId]);
+}
+
+// ── Phase 3: Messages queries ────────────────────────────
+export async function saveMessage(msg: {
+  id: string;
+  tenant_id: string;
+  recipient: string;
+  channel: string;
+  direction: string;
+  body: string;
+  status?: string;
+  external_id?: string;
+  metadata?: string;
+}) {
+  await query(
+    `INSERT INTO messages (id, tenant_id, recipient, channel, direction, body, status, external_id, metadata) VALUES (?,?,?,?,?,?,?,?,?)`,
+    [msg.id, msg.tenant_id, msg.recipient, msg.channel, msg.direction, msg.body, msg.status || "sent", msg.external_id || null, msg.metadata || "{}"],
+  );
+  return queryOne("SELECT * FROM messages WHERE id = ?", [msg.id]);
+}
+
+export async function getMessages(tenantId: string, limit = 50) {
+  return query("SELECT * FROM messages WHERE tenant_id = ? ORDER BY created_at DESC LIMIT ?", [tenantId, limit]);
+}
+
+// ── Phase 3: Payment queries ─────────────────────────────
+export async function createPaymentIntent(pi: {
+  id: string;
+  tenant_id: string;
+  stripe_pi_id?: string;
+  amount: number;
+  currency?: string;
+  customer_email?: string;
+  customer_name?: string;
+  description?: string;
+  metadata?: string;
+}) {
+  await query(
+    `INSERT INTO payment_intents (id, tenant_id, stripe_pi_id, amount, currency, customer_email, customer_name, description, metadata) VALUES (?,?,?,?,?,?,?,?,?)`,
+    [pi.id, pi.tenant_id, pi.stripe_pi_id || null, pi.amount, pi.currency || "usd", pi.customer_email || null, pi.customer_name || null, pi.description || null, pi.metadata || "{}"],
+  );
+  return queryOne("SELECT * FROM payment_intents WHERE id = ?", [pi.id]);
+}
+
+export async function updatePaymentIntent(id: string, updates: { stripe_pi_id?: string; status?: string; completed_at?: string }) {
+  await query(
+    `UPDATE payment_intents SET stripe_pi_id=COALESCE(?,stripe_pi_id), status=COALESCE(?,status), completed_at=COALESCE(?,completed_at) WHERE id=?`,
+    [updates.stripe_pi_id || null, updates.status || null, updates.completed_at || null, id],
+  );
+  return queryOne("SELECT * FROM payment_intents WHERE id = ?", [id]);
+}
+
+export async function getPaymentIntents(tenantId: string) {
+  return query("SELECT * FROM payment_intents WHERE tenant_id = ? ORDER BY created_at DESC", [tenantId]);
+}
+
+// ── Phase 3: Workflow queries ────────────────────────────
+export async function createWorkflow(wf: {
+  id: string;
+  tenant_id: string;
+  name: string;
+  trigger_event: string;
+  conditions?: string;
+  actions: string;
+}) {
+  await query(
+    `INSERT INTO workflows (id, tenant_id, name, trigger_event, conditions, actions) VALUES (?,?,?,?,?,?)`,
+    [wf.id, wf.tenant_id, wf.name, wf.trigger_event, wf.conditions || "{}", wf.actions],
+  );
+  return queryOne("SELECT * FROM workflows WHERE id = ?", [wf.id]);
+}
+
+export async function getWorkflows(tenantId: string) {
+  return query("SELECT * FROM workflows WHERE tenant_id = ? AND enabled = 1 ORDER BY created_at", [tenantId]);
+}
+
+export async function getWorkflowsByTrigger(tenantId: string, event: string) {
+  return query("SELECT * FROM workflows WHERE tenant_id = ? AND trigger_event = ? AND enabled = 1", [tenantId, event]);
+}
+
+export async function logWorkflowRun(run: {
+  id: string;
+  tenant_id: string;
+  workflow_id: string;
+  trigger_data?: string;
+  status?: string;
+  results?: string;
+}) {
+  await query(
+    `INSERT INTO workflow_runs (id, tenant_id, workflow_id, trigger_data, status, results) VALUES (?,?,?,?,?,?)`,
+    [run.id, run.tenant_id, run.workflow_id, run.trigger_data || "{}", run.status || "completed", run.results || "[]"],
+  );
+  return queryOne("SELECT * FROM workflow_runs WHERE id = ?", [run.id]);
 }

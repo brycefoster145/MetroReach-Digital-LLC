@@ -4,8 +4,12 @@
 
 import OpenAI from "openai";
 import { randomUUID } from "node:crypto";
-import { getTenantBySlug, getDepartments, saveLead } from "./db.js";
+import { getTenantBySlug, getDepartments, saveLead, saveCall } from "./db.js";
 import { bookAppointment, rescheduleAppointment, cancelAppointment, getUpcomingAppointments } from "./appointments.js";
+import { recognizeCaller } from "./memory.js";
+import { scoreLead, analyzeTranscriptForSignals } from "./scoring.js";
+import { detectSentiment, getSentimentGuidance } from "./sentiment.js";
+import { fireTrigger } from "./workflows.js";
 
 let openai: OpenAI | null = null;
 function getOpenAI(): OpenAI {
@@ -37,22 +41,31 @@ function parseKnowledge(json: string): any {
 }
 
 // ── Incoming call handler ──────────────────────────────
-export async function handleIncomingCall(slug: string): Promise<string> {
+export async function handleIncomingCall(slug: string, from?: string): Promise<string> {
   const tenant = await getTenantBySlug(slug);
   if (!tenant) return twiml(say("Sorry, I couldn't find this business. Goodbye."), hangup());
 
   const knowledge = parseKnowledge(tenant.knowledge);
   const name = knowledge.businessName || tenant.name;
 
+  // ── Caller memory ──
+  let callerGreeting = "";
+  if (from) {
+    const ctx = await recognizeCaller(tenant.id, from);
+    if (ctx.isReturning && ctx.personalizedGreeting) {
+      callerGreeting = ctx.personalizedGreeting + " ";
+    }
+  }
+
   // Check for IVR/department routing
   const depts = await getDepartments(tenant.id);
   if (depts && depts.length > 0) {
-    return buildIVRMenu(name, depts, slug);
+    return buildIVRMenu(name, depts, slug, callerGreeting);
   }
 
   // Default: speech-driven greeting
   const hours = knowledge.hours ? ` We're open ${knowledge.hours}.` : "";
-  const greeting = `Thank you for calling ${name}. I'm the automated receptionist. How can I help you today?${hours}`;
+  const greeting = `${callerGreeting}Thank you for calling ${name}. I'm the automated receptionist. How can I help you today?${hours}`;
   const respondUrl = `/api/receptionist/twilio/voice/respond?slug=${encodeURIComponent(slug)}`;
 
   return twiml(
@@ -62,9 +75,9 @@ export async function handleIncomingCall(slug: string): Promise<string> {
   );
 }
 
-function buildIVRMenu(businessName: string, depts: any[], slug: string): string {
+function buildIVRMenu(businessName: string, depts: any[], slug: string, callerGreeting = ""): string {
   const parts: string[] = [];
-  parts.push(say(`Thank you for calling ${businessName}.`));
+  parts.push(say(`${callerGreeting}Thank you for calling ${businessName}.`));
 
   // Build menu
   const menuParts: string[] = [];
@@ -116,12 +129,25 @@ export async function handleSpeechResponse(
   speechResult: string,
   callSid: string,
   dept?: string,
+  from?: string,
 ): Promise<string> {
   const tenant = await getTenantBySlug(slug);
   if (!tenant) return twiml(say("Sorry, goodbye."), hangup());
 
   const knowledge = parseKnowledge(tenant.knowledge);
   const input = speechResult.trim().toLowerCase();
+
+  // ── Sentiment detection ──
+  const sentiment = detectSentiment(speechResult);
+  const sentimentNote = getSentimentGuidance(sentiment.label);
+  if (sentimentNote) console.log(`[sentiment] ${slug}: ${sentiment.label} (${sentiment.score})`);
+
+  // ── Objection handling ──
+  const objectionResponse = handleObjection(input, knowledge);
+  if (objectionResponse) {
+    const respondUrl = `/api/receptionist/twilio/voice/respond?slug=${encodeURIComponent(slug)}`;
+    return twiml(say(objectionResponse), gather(respondUrl, "", 5));
+  }
 
   // Intent detection
   if (input.match(/appointment|schedule|book|reserve|set up/)) {
@@ -160,10 +186,15 @@ export async function handleSpeechResponse(
     const ai = getOpenAI();
     const systemPrompt = buildVoicePrompt(knowledge);
 
+    // Add sentiment guidance to prompt
+    const fullPrompt = sentimentNote
+      ? `${systemPrompt}\n\nIMPORTANT: ${sentimentNote}`
+      : systemPrompt;
+
     const response = await ai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
-        { role: "system", content: systemPrompt },
+        { role: "system", content: fullPrompt },
         { role: "user", content: speechResult },
       ],
       max_tokens: 150,
@@ -261,6 +292,38 @@ export async function handleRecordingCallback(callSid: string, recordingUrl: str
 }
 
 // ── Helpers ────────────────────────────────────────────
+
+// ── Objection handling scripts ─────────────────────────
+function handleObjection(input: string, knowledge: any): string | null {
+  const biz = knowledge.businessName || "our business";
+
+  if (input.match(/too expensive|too much|can't afford|out of.*budget|overpriced|cheaper/i)) {
+    return `I understand budget is important. At ${biz}, we focus on quality and value. Would you like me to have someone discuss flexible payment options with you?`;
+  }
+
+  if (input.match(/not interested|no thanks|just looking|just browsing/i)) {
+    return "That's completely fine! Is there anything specific you'd like to know about, or would you like me to take your contact info in case we have any special offers?";
+  }
+
+  if (input.match(/send.*email|mail me|email me.*info/i)) {
+    return `I'd be happy to have information sent to you. Can I get your email address? You can also leave your name and number and we'll follow up right away.`;
+  }
+
+  if (input.match(/call back|call me|have someone call|speak to.*manager|talk to.*boss/i)) {
+    return `I'll make sure someone calls you back. Can I get your name and the best number to reach you?`;
+  }
+
+  if (input.match(/competitor|other.*company|someone else|going with/i)) {
+    return `We understand you have choices. What matters most to you — is it pricing, timing, or something specific? I'd love to see if we can help.`;
+  }
+
+  if (input.match(/think about|get back to|decide|not ready/i)) {
+    return `Take your time! Would it help if I send you some information to review, or would you prefer a follow-up call in a few days?`;
+  }
+
+  return null;
+}
+
 function buildVoicePrompt(knowledge: any): string {
   const parts = [
     `You are an AI phone receptionist for ${knowledge.businessName || "a local business"}.`,
