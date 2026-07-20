@@ -42,6 +42,10 @@ import { sendEmail, sendInvoice } from "./email.js";
 import { createPayment, checkPaymentStatus, requestDeposit } from "./payments.js";
 import { postCallFollowUp, paymentFollowUpSequence } from "./followups.js";
 import { fireTrigger, WORKFLOW_TEMPLATES } from "./workflows.js";
+import { getDashboard, getQuickStats, getCustomerSatisfaction } from "./analytics.js";
+import { recordAudit, getAuditTrail, getComplianceStatus, generateConsentTwiml } from "./compliance.js";
+import { synthesizeSpeech, PERSONA_TEMPLATES, detectLanguage, translateResponse } from "./premium.js";
+import { sendWhatsApp, sendFacebookMessage, sendInstagramMessage } from "./channels.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -461,14 +465,111 @@ app.get("/api/messages/:slug", async (req, res) => {
   res.json(await getMessages(tenant.id));
 });
 
+// ── Phase 4: Analytics ────────────────────────────────
+app.get("/api/analytics/:slug/dashboard", async (req, res) => {
+  const dashboard = await getDashboard(req.params.slug);
+  if (!dashboard) { res.status(404).json({ error: "Not found" }); return; }
+  res.json(dashboard);
+});
+
+app.get("/api/analytics/:slug/quickstats", async (req, res) => {
+  const stats = await getQuickStats(req.params.slug);
+  res.json({ stats });
+});
+
+app.get("/api/analytics/:slug/satisfaction", async (req, res) => {
+  const sat = await getCustomerSatisfaction(req.params.slug);
+  res.json(sat);
+});
+
+// ── Phase 4: Compliance ────────────────────────────────
+app.get("/api/compliance/:slug/audit", async (req, res) => {
+  const tenant = await getTenantBySlug(req.params.slug);
+  if (!tenant) { res.status(404).json({ error: "Not found" }); return; }
+  res.json(await getAuditTrail(tenant.id));
+});
+
+app.post("/api/compliance/:slug/audit", async (req, res) => {
+  const tenant = await getTenantBySlug(req.params.slug);
+  if (!tenant) { res.status(404).json({ error: "Not found" }); return; }
+  await recordAudit(tenant.id, req.body.action, req.body.actor, req.body.details, req.ip);
+  res.json({ success: true });
+});
+
+app.get("/api/compliance/status", (_req, res) => {
+  res.json(getComplianceStatus());
+});
+
+app.post("/api/compliance/:slug/consent-twiml", async (req, res) => {
+  const tenant = await getTenantBySlug(req.params.slug);
+  if (!tenant) { res.status(404).json({ error: "Not found" }); return; }
+  const twiml = generateConsentTwiml(tenant.name, req.body.nextActionUrl || "/api/twilio/voice");
+  res.type("text/xml").send(twiml);
+});
+
+// ── Phase 4: Premium — Voice Cloning ───────────────────
+app.post("/api/premium/:slug/synthesize", async (req, res) => {
+  const { text, voiceId } = req.body;
+  if (!text) { res.status(400).json({ error: "text required" }); return; }
+  const result = await synthesizeSpeech(text, voiceId);
+  res.json(result);
+});
+
+// ── Phase 4: Premium — Personas ────────────────────────
+app.get("/api/premium/personas", (_req, res) => {
+  res.json(PERSONA_TEMPLATES);
+});
+
+// ── Phase 4: Premium — Languages ───────────────────────
+app.post("/api/premium/:slug/detect-language", (req, res) => {
+  const { text } = req.body;
+  if (!text) { res.status(400).json({ error: "text required" }); return; }
+  res.json({ language: detectLanguage(text) });
+});
+
+app.post("/api/premium/:slug/translate", async (req, res) => {
+  const { text, targetLang } = req.body;
+  if (!text || !targetLang) { res.status(400).json({ error: "text and targetLang required" }); return; }
+  const translated = await translateResponse(text, targetLang);
+  res.json({ translated });
+});
+
+// ── Phase 4: Multi-Channel ─────────────────────────────
+app.post("/api/channels/:slug/whatsapp", async (req, res) => {
+  const tenant = await getTenantBySlug(req.params.slug);
+  if (!tenant) { res.status(404).json({ error: "Not found" }); return; }
+  const { to, body } = req.body;
+  if (!to || !body) { res.status(400).json({ error: "to and body required" }); return; }
+  const result = await sendWhatsApp(tenant.id, to, body);
+  res.json(result);
+});
+
+app.post("/api/channels/:slug/facebook", async (req, res) => {
+  const tenant = await getTenantBySlug(req.params.slug);
+  if (!tenant) { res.status(404).json({ error: "Not found" }); return; }
+  const { to, body } = req.body;
+  if (!to || !body) { res.status(400).json({ error: "to and body required" }); return; }
+  const result = await sendFacebookMessage(tenant.id, to, body);
+  res.json(result);
+});
+
+app.post("/api/channels/:slug/instagram", async (req, res) => {
+  const tenant = await getTenantBySlug(req.params.slug);
+  if (!tenant) { res.status(404).json({ error: "Not found" }); return; }
+  const { to, body } = req.body;
+  if (!to || !body) { res.status(400).json({ error: "to and body required" }); return; }
+  const result = await sendInstagramMessage(tenant.id, to, body);
+  res.json(result);
+});
+
 // ── Health ────────────────────────────────────────────
 app.get("/health", (_req, res) => {
-  res.json({ status: "ok", phase: "2+3", timestamp: new Date().toISOString() });
+  res.json({ status: "ok", phase: "4", timestamp: new Date().toISOString() });
 });
 
 // ── Start ─────────────────────────────────────────────
 app.listen(PORT, "127.0.0.1", () => {
-  console.log(`🧠 AI Receptionist Phase 2&3 running on http://127.0.0.1:${PORT}`);
+  console.log(`🧠 AI Receptionist Phase 4 running on http://127.0.0.1:${PORT}`);
   console.log(`   Demo: http://127.0.0.1:${PORT}/widget/demo.js`);
 });
 

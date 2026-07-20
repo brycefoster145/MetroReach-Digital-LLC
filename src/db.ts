@@ -282,6 +282,22 @@ export async function initDb(): Promise<void> {
     )
   `);
 
+  // Phase 4 — Audit logs (compliance)
+  await query(`
+    CREATE TABLE IF NOT EXISTS audit_logs (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL,
+      action TEXT NOT NULL,
+      actor TEXT DEFAULT 'system',
+      details TEXT DEFAULT '{}',
+      ip_address TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (tenant_id) REFERENCES tenants(id)
+    )
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_audit_tenant ON audit_logs(tenant_id)`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_logs(action)`);
+
   console.log(`✅ Database initialized (${hasPostgres() ? "Postgres" : "SQLite"}) [Phase 2&3]`);
 }
 
@@ -627,4 +643,70 @@ export async function logWorkflowRun(run: {
     [run.id, run.tenant_id, run.workflow_id, run.trigger_data || "{}", run.status || "completed", run.results || "[]"],
   );
   return queryOne("SELECT * FROM workflow_runs WHERE id = ?", [run.id]);
+}
+
+// ── Phase 4: Audit logs ─────────────────────────────────
+export async function logAudit(entry: {
+  id: string;
+  tenant_id: string;
+  action: string;
+  actor?: string;
+  details?: string;
+  ip_address?: string;
+}) {
+  await query(
+    `INSERT INTO audit_logs (id, tenant_id, action, actor, details, ip_address) VALUES (?,?,?,?,?,?)`,
+    [entry.id, entry.tenant_id, entry.action, entry.actor || "system", entry.details || "{}", entry.ip_address || null],
+  );
+  return queryOne("SELECT * FROM audit_logs WHERE id = ?", [entry.id]);
+}
+
+export async function getAuditLogs(tenantId: string, limit = 100) {
+  return query("SELECT * FROM audit_logs WHERE tenant_id = ? ORDER BY created_at DESC LIMIT ?", [tenantId, limit]);
+}
+
+// ── Phase 4: Analytics queries ──────────────────────────
+export async function getAnalyticsSummary(tenantId: string): Promise<{
+  totalCalls: number;
+  totalLeads: number;
+  totalAppointments: number;
+  totalRevenue: number;
+  avgCallDuration: number;
+  conversionRate: number;
+}> {
+  const [calls] = await query("SELECT COUNT(*) as count FROM calls WHERE tenant_id = ?", [tenantId]);
+  const [leads] = await query("SELECT COUNT(*) as count FROM leads WHERE tenant_id = ?", [tenantId]);
+  const [appts] = await query("SELECT COUNT(*) as count FROM appointments WHERE tenant_id = ?", [tenantId]);
+  const [revenue] = await query("SELECT COALESCE(SUM(amount),0) as total FROM payment_intents WHERE tenant_id = ? AND status = 'completed'", [tenantId]);
+  const [avgDur] = await query("SELECT COALESCE(AVG(duration),0) as avg FROM calls WHERE tenant_id = ?", [tenantId]);
+
+  const totalCalls = (calls as any)?.count || 0;
+  const totalBooked = (appts as any)?.count || 0;
+
+  return {
+    totalCalls,
+    totalLeads: (leads as any)?.count || 0,
+    totalAppointments: totalBooked,
+    totalRevenue: (revenue as any)?.total || 0,
+    avgCallDuration: Math.round((avgDur as any)?.avg || 0),
+    conversionRate: totalCalls > 0 ? Math.round((totalBooked / totalCalls) * 100) : 0,
+  };
+}
+
+export async function getCallVolumeByDay(tenantId: string, days = 7) {
+  return query(
+    `SELECT date(created_at) as day, COUNT(*) as count FROM calls WHERE tenant_id = ? AND created_at >= datetime('now', ?) GROUP BY day ORDER BY day`,
+    [tenantId, `-${days} days`],
+  );
+}
+
+export async function getLeadsBySource(tenantId: string) {
+  return query("SELECT source, COUNT(*) as count FROM leads WHERE tenant_id = ? GROUP BY source", [tenantId]);
+}
+
+export async function getSentimentSummary(tenantId: string) {
+  return query(
+    "SELECT sentiment, COUNT(*) as count FROM sentiment_logs WHERE tenant_id = ? GROUP BY sentiment",
+    [tenantId],
+  );
 }
