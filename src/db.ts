@@ -51,7 +51,11 @@ async function query(sql: string, params: any[] = []): Promise<any[]> {
     let paramIdx = 1;
     pgSql = pgSql.replace(/\?/g, () => "$" + paramIdx++);
     // Convert SQLite-isms to Postgres
+    pgSql = pgSql.replace(/datetime\('now'\s*,\s*'(-?\d+)\s*days?'\)/gi, (_, num) => {
+      return num.startsWith("-") ? `CURRENT_DATE - INTERVAL '${num.slice(1)} days'` : `CURRENT_DATE + INTERVAL '${num} days'`;
+    });
     pgSql = pgSql.replace(/datetime\('now'\)/gi, "CURRENT_TIMESTAMP");
+    pgSql = pgSql.replace(/datetime\('now'\s*,\s*'localtime'\)/gi, "CURRENT_TIMESTAMP");
     pgSql = pgSql.replace(/INSERT OR REPLACE INTO/gi, "INSERT INTO");
     const result = await getPg().query(pgSql, params);
     return result as any[];
@@ -694,9 +698,14 @@ export async function getAnalyticsSummary(tenantId: string): Promise<{
 }
 
 export async function getCallVolumeByDay(tenantId: string, days = 7) {
+  // Compute date in JS to avoid SQLite datetime() which Postgres doesn't support
+  const since = new Date();
+  since.setDate(since.getDate() - days);
+  const dateStr = since.toISOString().split("T")[0];
+
   return query(
-    `SELECT date(created_at) as day, COUNT(*) as count FROM calls WHERE tenant_id = ? AND created_at >= datetime('now', ?) GROUP BY day ORDER BY day`,
-    [tenantId, `-${days} days`],
+    `SELECT date(created_at) as day, COUNT(*) as count FROM calls WHERE tenant_id = ? AND created_at >= ? GROUP BY day ORDER BY day`,
+    [tenantId, dateStr],
   );
 }
 

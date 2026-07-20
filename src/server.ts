@@ -426,6 +426,11 @@ app.post("/api/followups/:slug/post-call", async (req, res) => {
 });
 
 // ── Phase 3: Workflows ────────────────────────────────
+// Static routes MUST be before parameterized :slug routes
+app.get("/api/workflows/templates", async (_req, res) => {
+  res.json(WORKFLOW_TEMPLATES);
+});
+
 app.get("/api/workflows/:slug", async (req, res) => {
   const tenant = await getTenantBySlug(req.params.slug);
   if (!tenant) { res.status(404).json({ error: "Not found" }); return; }
