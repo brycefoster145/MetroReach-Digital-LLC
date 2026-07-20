@@ -6,7 +6,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { getTenantBySlug, createAppointment, updateAppointment, getAppointments, checkAvailability } from "./db-v2.js";
+import { getTenantBySlug, createAppointment, updateAppointment, getAppointments, checkAvailability } from "./db.js";
 import { syncAppointmentToCalendar, cancelCalendarEvent } from "./calendar.js";
 
 export interface BookResult {

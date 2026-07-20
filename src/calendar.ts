@@ -5,7 +5,7 @@
  * Each tenant can configure their calendar provider in tenant.calendar_config.
  */
 
-import { getTenantById, updateAppointment } from "./db-v2.js";
+import { getTenantById, updateAppointment } from "./db.js";
 
 interface CalendarConfig {
   provider?: "google" | "outlook" | "none";
@@ -47,7 +47,7 @@ export async function syncAppointmentToCalendar(
 
   if (!config.provider || config.provider === "none") return null;
 
-  const appointment = await (await import("./db-v2.js")).getAppointments(tenantId, undefined, undefined)
+  const appointment = await (await import("./db.js")).getAppointments(tenantId, undefined, undefined)
     .then(rows => (rows as any[]).find(a => a.id === appointmentId));
   if (!appointment) return null;
 
@@ -217,7 +217,7 @@ export async function cancelCalendarEvent(appointmentId: string, tenantId: strin
   if (!tenant) return false;
 
   const config: CalendarConfig = JSON.parse(tenant.calendar_config || "{}");
-  const appointment = await (await import("./db-v2.js")).getAppointments(tenantId)
+  const appointment = await (await import("./db.js")).getAppointments(tenantId)
     .then(rows => (rows as any[]).find(a => a.id === appointmentId));
   if (!appointment?.calendar_event_id) return false;
 

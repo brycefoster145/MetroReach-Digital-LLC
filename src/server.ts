@@ -24,12 +24,12 @@ import {
   initDb, getTenantBySlug, getTenantById, getAllTenants, upsertTenant,
   getDepartments, upsertDepartment, getAppointments, getLeads,
   createAppointment, updateAppointment, getCalls, saveCall,
-} from "./db-v2.js";
+} from "./db.js";
 import { chat, captureLead } from "./agent.js";
 import {
   handleIncomingCall, handleSpeechResponse, handleLeadCapture,
   handleIVR, handleRecordingCallback,
-} from "./voice-v2.js";
+} from "./voice.js";
 import { bookAppointment, rescheduleAppointment, cancelAppointment } from "./appointments.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));

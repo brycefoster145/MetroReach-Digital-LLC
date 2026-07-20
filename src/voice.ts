@@ -4,7 +4,7 @@
 
 import OpenAI from "openai";
 import { randomUUID } from "node:crypto";
-import { getTenantBySlug, getDepartments, saveLead } from "./db-v2.js";
+import { getTenantBySlug, getDepartments, saveLead } from "./db.js";
 import { bookAppointment, rescheduleAppointment, cancelAppointment, getUpcomingAppointments } from "./appointments.js";
 
 let openai: OpenAI | null = null;
