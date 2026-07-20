@@ -1,0 +1,27 @@
+{
+  "name": "metroreach-ai-receptionist",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Phase 1 — Multi-tenant AI Phone Receptionist",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "start": "node dist/server.js",
+    "build": "tsc"
+  },
+  "dependencies": {
+    "@neondatabase/serverless": "^1.1.0",
+    "better-sqlite3": "^11.9.0",
+    "cors": "^2.8.5",
+    "express": "^5.1.0",
+    "openai": "^5.15.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.3",
+    "@types/node": "^22.15.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.3"
+  }
+}
